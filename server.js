@@ -89,8 +89,8 @@ wss.on('connection', (ws) => {
         if (!rooms.has(roomId)) rooms.set(roomId, new Map());
         const room = rooms.get(roomId);
 
-        if (room.size >= 12) {
-          ws.send(JSON.stringify({ type: 'error', message: 'Room is full (max 12)' }));
+        if (room.size >= 20) {
+          ws.send(JSON.stringify({ type: 'error', message: 'Room is full (max 20)' }));
           return;
         }
 
