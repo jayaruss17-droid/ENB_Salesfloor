@@ -1055,6 +1055,11 @@ function onPeerStatus(msg) {
   if (!peerInfo[msg.id]) return;
   Object.assign(peerInfo[msg.id], { status: msg.status, muted: msg.muted, camOff: msg.camOff });
   updatePeerCard(msg.id);
+
+  // If this peer just went on-call, mute their incoming audio on our end
+  // so the floor can't hear their prospect conversation either
+  const video = document.getElementById(`video-${msg.id}`);
+  if (video) video.muted = (msg.status === 'on-call');
 }
 
 // ════════════════════════════════════════════════════════════
@@ -1167,20 +1172,38 @@ function toggleCam() {
 function toggleOnCall() {
   onCall = !onCall;
   if (onCall) {
+    // Mute outgoing mic so prospect doesn't hear the floor
     micBeforeCall = micOn;
     micOn = false;
     myStream?.getAudioTracks().forEach(t => t.enabled = false);
-    showToast('On call — mic auto-muted');
+
+    // Mute ALL incoming peer audio so the floor doesn't distract the BDR
+    muteAllIncomingAudio(true);
+
+    showToast('On call — floor audio muted both ways');
     addSysMsg(`${myName} is on a call with a prospect`);
     send({ type: 'status-update', status: 'on-call', muted: true });
   } else {
+    // Restore outgoing mic to previous state
     micOn = micBeforeCall;
     myStream?.getAudioTracks().forEach(t => t.enabled = micOn);
+
+    // Restore incoming floor audio
+    muteAllIncomingAudio(false);
+
     showToast('Call ended — back on the floor');
     addSysMsg(`${myName} is back on the floor`);
     send({ type: 'status-update', status: 'available', muted: !micOn });
   }
   syncControls(); updateMyCard();
+}
+
+// Mute/unmute all peer video elements (controls incoming audio)
+function muteAllIncomingAudio(shouldMute) {
+  Object.keys(peerInfo).forEach(id => {
+    const video = document.getElementById(`video-${id}`);
+    if (video) video.muted = shouldMute;
+  });
 }
 
 function syncControls() {
