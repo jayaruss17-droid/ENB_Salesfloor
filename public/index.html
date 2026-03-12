@@ -333,6 +333,10 @@
     <svg width="14" height="12" viewBox="0 0 14 12" fill="none"><rect x="0" y="2" width="9" height="8" rx="1.5" stroke="currentColor" stroke-width="1.4"/><path d="M9 4.5l4-2.5v8l-4-2.5" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
     <span>Cam on</span>
   </button>
+  <button class="ctrl-btn" id="blur-btn" onclick="toggleBlur()">
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="3" stroke="currentColor" stroke-width="1.4"/><circle cx="7" cy="7" r="6" stroke="currentColor" stroke-width="1.4" stroke-dasharray="2 2"/></svg>
+    <span>Blur bg</span>
+  </button>
   <div class="ctrl-divider"></div>
   <button class="ctrl-btn on-call-btn" id="call-btn" onclick="toggleOnCall()">
     <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2 1h3l1.5 3.5-2 1.2a8 8 0 003.8 3.8l1.2-2L13 9v3a1 1 0 01-1 1C5.4 13 0 7.6 0 2a1 1 0 011-1h1z" fill="currentColor"/></svg>
@@ -749,6 +753,50 @@ function updateOnlineCount() {
 // ════════════════════════════════════════════════════════════
 //  CONTROLS
 // ════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════
+//  BACKGROUND BLUR
+//  Uses Chrome's native MediaStreamTrack background blur API
+//  where available. Falls back to CSS blur on the video element
+//  for other browsers (blurs the whole video, not just bg —
+//  acceptable fallback until Safari/Firefox support lands).
+// ════════════════════════════════════════════════════════════
+let blurOn = false;
+let blurredStream = null;   // holds the processed stream when native blur is active
+
+async function toggleBlur() {
+  blurOn = !blurOn;
+  const btn = document.getElementById('blur-btn');
+  btn.className = 'ctrl-btn' + (blurOn ? ' active' : '');
+  btn.querySelector('span').textContent = blurOn ? 'Blur on' : 'Blur bg';
+
+  // ── Try native background blur (Chrome 105+) ──────────────
+  const videoTrack = myStream?.getVideoTracks()[0];
+  if (videoTrack && typeof videoTrack.applyConstraints === 'function') {
+    try {
+      const capabilities = videoTrack.getCapabilities?.() || {};
+      // Check if backgroundBlur is supported
+      if (capabilities.backgroundBlur || 'backgroundBlur' in (videoTrack.getSettings?.() || {})) {
+        await videoTrack.applyConstraints({
+          advanced: [{ backgroundBlur: blurOn }]
+        });
+        showToast(blurOn ? 'Background blur on' : 'Background blur off');
+        return; // native worked, done
+      }
+    } catch (e) {
+      // Native failed, fall through to CSS fallback
+    }
+  }
+
+  // ── CSS fallback: blur the local video element only ────────
+  // Not true background blur but better than nothing on non-Chrome
+  const myVid = document.getElementById('video-me');
+  if (myVid) {
+    myVid.style.filter = blurOn ? 'blur(8px)' : '';
+    myVid.style.transform = blurOn ? 'scale(1.08)' : ''; // hide blurred edges
+  }
+  showToast(blurOn ? 'Video blur on (CSS fallback)' : 'Blur off');
+}
+
 function toggleMic() {
   if (onCall) { showToast('Auto-muted while on a prospect call'); return; }
   micOn = !micOn;
@@ -761,7 +809,11 @@ function toggleCam() {
   myStream?.getVideoTracks().forEach(t => t.enabled = camOn);
   const vid = document.getElementById('video-me');
   const fallback = document.getElementById('fallback-me');
-  if (vid) vid.srcObject = (myStream && camOn) ? myStream : null;
+  if (vid) {
+    vid.srcObject = (myStream && camOn) ? myStream : null;
+    // Clear blur filter if cam is turned off
+    if (!camOn) { vid.style.filter = ''; vid.style.transform = ''; }
+  }
   if (fallback) fallback.classList.toggle('hidden', camOn);
   syncControls();
   send({ type: 'status-update', camOff: !camOn });
