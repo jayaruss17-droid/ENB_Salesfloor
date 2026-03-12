@@ -409,7 +409,7 @@ function connectWS() {
   ws.onmessage = async (evt) => {
     const msg = JSON.parse(evt.data);
     switch (msg.type) {
-      case 'room-list':     onRoomList(msg);          break;
+      case 'room-directory': onRoomList(msg);          break;
       case 'room-created':  onRoomCreated(msg);        break;
       case 'joined':        await onJoined(msg);       break;
       case 'peer-joined':   await onPeerJoined(msg);   break;
@@ -516,7 +516,15 @@ function confirmCreateRoom() {
 let previewStream = null, prevCamOn = true, prevMicOn = true;
 async function startPreview() {
   try {
-    previewStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    previewStream = await navigator.mediaDevices.getUserMedia({
+      video: true,
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl:  true,
+        sampleRate:       48000,
+      }
+    });
     document.getElementById('preview-video').srcObject = previewStream;
   } catch {
     prevCamOn = false;
@@ -537,6 +545,71 @@ startPreview();
 connectWS();
 
 // ════════════════════════════════════════════════════════════
+//  NOISE GATE
+//  Monitors mic volume every 80ms. If RMS level is below the
+//  threshold (faint background sounds, dialler tones bleeding
+//  through laptop speakers) the audio track is muted at source.
+//  Restores automatically when the level rises above threshold.
+// ════════════════════════════════════════════════════════════
+const NOISE_GATE_THRESHOLD = 0.015; // 0–1 scale; voice ~0.05–0.3, bleed-through ~0.002–0.01
+const NOISE_GATE_HOLD_MS   = 300;   // stay open this long after level drops, avoids clipping words
+
+let noiseGateCtx       = null;
+let noiseGateOpen      = true;  // true = passing audio, false = gated
+let noiseGateHoldTimer = null;
+
+function applyNoiseGate(stream) {
+  try {
+    noiseGateCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const source   = noiseGateCtx.createMediaStreamSource(stream);
+    const analyser = noiseGateCtx.createAnalyser();
+    analyser.fftSize = 512;
+    source.connect(analyser);
+
+    const buffer = new Float32Array(analyser.fftSize);
+
+    setInterval(() => {
+      // Don't interfere if manually muted or on a call
+      if (!micOn || onCall) return;
+
+      analyser.getFloatTimeDomainData(buffer);
+
+      // Calculate RMS (root mean square) — a measure of audio loudness
+      let sum = 0;
+      for (let i = 0; i < buffer.length; i++) sum += buffer[i] * buffer[i];
+      const rms = Math.sqrt(sum / buffer.length);
+
+      const audioTrack = stream.getAudioTracks()[0];
+      if (!audioTrack) return;
+
+      if (rms > NOISE_GATE_THRESHOLD) {
+        // Signal is loud enough — open gate
+        if (!noiseGateOpen) {
+          noiseGateOpen = true;
+          audioTrack.enabled = true;
+        }
+        // Reset hold timer
+        if (noiseGateHoldTimer) { clearTimeout(noiseGateHoldTimer); noiseGateHoldTimer = null; }
+      } else {
+        // Signal below threshold — close gate after hold period
+        if (noiseGateOpen && !noiseGateHoldTimer) {
+          noiseGateHoldTimer = setTimeout(() => {
+            if (micOn && !onCall) {
+              noiseGateOpen = false;
+              audioTrack.enabled = false;
+            }
+            noiseGateHoldTimer = null;
+          }, NOISE_GATE_HOLD_MS);
+        }
+      }
+    }, 80);
+
+  } catch(e) {
+    console.warn('Noise gate unavailable:', e);
+  }
+}
+
+// ════════════════════════════════════════════════════════════
 //  JOIN
 // ════════════════════════════════════════════════════════════
 async function joinFloor() {
@@ -549,12 +622,21 @@ async function joinFloor() {
 
   if (previewStream) { myStream = previewStream; }
   else {
-    try { myStream = await navigator.mediaDevices.getUserMedia({ video: camOn, audio: micOn }); }
+    try { myStream = await navigator.mediaDevices.getUserMedia({
+      video: camOn,
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl:  true,
+        sampleRate:       48000,
+      }
+    }); }
     catch { myStream = null; }
   }
   if (myStream) {
     myStream.getAudioTracks().forEach(t => t.enabled = micOn);
     myStream.getVideoTracks().forEach(t => t.enabled = camOn);
+    applyNoiseGate(myStream);
   }
   send({ type: 'join', room: MAIN_ROOM_ID, name: myName, role: myRole });
 }
@@ -577,6 +659,7 @@ async function onJoined(msg) {
 
   renderMyCard();
   syncControls();
+  if (msg.rooms) roomList = msg.rooms;
   renderRoomsSidebar();
 
   for (const peer of msg.peers) {
@@ -735,6 +818,8 @@ function updateOnlineCount() {
 function toggleMic() {
   if (onCall) { showToast('Auto-muted while on a prospect call'); return; }
   micOn = !micOn;
+  // Reset noise gate state so it doesn't fight the manual toggle
+  noiseGateOpen = micOn;
   myStream?.getAudioTracks().forEach(t => t.enabled = micOn);
   syncControls(); updateMyCard();
   send({ type: 'status-update', muted: !micOn });
@@ -786,10 +871,6 @@ function syncControls() {
   callBtn.className = 'ctrl-btn on-call-btn' + (onCall ? ' active' : '');
   callBtn.querySelector('span').textContent = onCall ? 'End call' : 'Go on call';
 }
-function exitToMainFloor() {
-  switchRoom(MAIN_ROOM_ID, 'BDR Floor');
-}
-
 function exitToMainFloor() {
   switchRoom(MAIN_ROOM_ID, 'BDR Floor');
 }
