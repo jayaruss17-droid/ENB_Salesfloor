@@ -754,14 +754,21 @@ function updateOnlineCount() {
 //  CONTROLS
 // ════════════════════════════════════════════════════════════
 // ════════════════════════════════════════════════════════════
-//  BACKGROUND BLUR
-//  Uses Chrome's native MediaStreamTrack background blur API
-//  where available. Falls back to CSS blur on the video element
-//  for other browsers (blurs the whole video, not just bg —
-//  acceptable fallback until Safari/Firefox support lands).
+//  BACKGROUND BLUR — MediaPipe Selfie Segmentation
+//  Segments the person from background on a canvas, blurs only
+//  the background pixels, streams the canvas back as the video
+//  track sent to peers. Works in all modern browsers.
 // ════════════════════════════════════════════════════════════
-let blurOn = false;
-let blurredStream = null;   // holds the processed stream when native blur is active
+let blurOn          = false;
+let segmentation    = null;   // MediaPipe SelfieSegmentation instance
+let blurCanvas      = null;   // offscreen canvas for compositing
+let blurCtx         = null;
+let blurRawVideo    = null;   // hidden <video> playing the raw camera stream
+let blurAnimFrame   = null;   // requestAnimationFrame handle
+let blurOutputStream = null;  // canvas.captureStream() — sent to peers
+let rawStream       = null;   // original camera stream kept for restoring
+
+const BLUR_AMOUNT = 16; // px — tweak for stronger/softer blur
 
 async function toggleBlur() {
   blurOn = !blurOn;
@@ -769,32 +776,133 @@ async function toggleBlur() {
   btn.className = 'ctrl-btn' + (blurOn ? ' active' : '');
   btn.querySelector('span').textContent = blurOn ? 'Blur on' : 'Blur bg';
 
-  // ── Try native background blur (Chrome 105+) ──────────────
-  const videoTrack = myStream?.getVideoTracks()[0];
-  if (videoTrack && typeof videoTrack.applyConstraints === 'function') {
-    try {
-      const capabilities = videoTrack.getCapabilities?.() || {};
-      // Check if backgroundBlur is supported
-      if (capabilities.backgroundBlur || 'backgroundBlur' in (videoTrack.getSettings?.() || {})) {
-        await videoTrack.applyConstraints({
-          advanced: [{ backgroundBlur: blurOn }]
-        });
-        showToast(blurOn ? 'Background blur on' : 'Background blur off');
-        return; // native worked, done
-      }
-    } catch (e) {
-      // Native failed, fall through to CSS fallback
-    }
+  if (blurOn) {
+    await startBackgroundBlur();
+  } else {
+    stopBackgroundBlur();
+  }
+}
+
+async function startBackgroundBlur() {
+  showToast('Loading background blur…');
+
+  // ── 1. Load MediaPipe if not already loaded ────────────────
+  if (!window.SelfieSegmentation) {
+    await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation@0.1/selfie_segmentation.js');
   }
 
-  // ── CSS fallback: blur the local video element only ────────
-  // Not true background blur but better than nothing on non-Chrome
-  const myVid = document.getElementById('video-me');
-  if (myVid) {
-    myVid.style.filter = blurOn ? 'blur(8px)' : '';
-    myVid.style.transform = blurOn ? 'scale(1.08)' : ''; // hide blurred edges
+  // ── 2. Set up SelfieSegmentation ──────────────────────────
+  segmentation = new SelfieSegmentation({ locateFile: (f) =>
+    `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation@0.1/${f}`
+  });
+  segmentation.setOptions({ modelSelection: 1, selfieMode: true });
+
+  // ── 3. Set up offscreen canvas ─────────────────────────────
+  const videoTrack = myStream.getVideoTracks()[0];
+  const { width = 640, height = 480 } = videoTrack.getSettings();
+
+  blurCanvas = document.createElement('canvas');
+  blurCanvas.width  = width;
+  blurCanvas.height = height;
+  blurCtx = blurCanvas.getContext('2d');
+
+  // ── 4. Hidden video element to feed raw frames ─────────────
+  blurRawVideo = document.createElement('video');
+  blurRawVideo.srcObject = myStream;
+  blurRawVideo.autoplay  = true;
+  blurRawVideo.muted     = true;
+  blurRawVideo.playsInline = true;
+  await blurRawVideo.play();
+
+  // ── 5. Wire segmentation result handler ───────────────────
+  segmentation.onResults((results) => {
+    if (!blurCtx) return;
+    const { width: w, height: h } = blurCanvas;
+
+    // ── Step 1: draw the full sharp frame ─────────────────────
+    blurCtx.clearRect(0, 0, w, h);
+    blurCtx.drawImage(results.image, 0, 0, w, h);
+
+    // ── Step 2: cut out the person shape (keep background only)
+    // destination-out erases canvas pixels where mask is white (= person)
+    blurCtx.globalCompositeOperation = 'destination-out';
+    blurCtx.drawImage(results.segmentationMask, 0, 0, w, h);
+
+    // ── Step 3: draw blurred full frame behind remaining pixels
+    // destination-over paints underneath what's already on canvas
+    // so it fills the background hole with blurred pixels only
+    blurCtx.filter = `blur(${BLUR_AMOUNT}px)`;
+    blurCtx.globalCompositeOperation = 'destination-over';
+    blurCtx.drawImage(results.image, 0, 0, w, h);
+
+    // ── Reset ──────────────────────────────────────────────────
+    blurCtx.filter = 'none';
+    blurCtx.globalCompositeOperation = 'source-over';
+  });
+
+  // ── 6. Frame loop ─────────────────────────────────────────
+  rawStream = myStream;
+
+  async function processFrame() {
+    if (!blurOn) return;
+    if (blurRawVideo.readyState >= 2) {
+      await segmentation.send({ image: blurRawVideo });
+    }
+    blurAnimFrame = requestAnimationFrame(processFrame);
   }
-  showToast(blurOn ? 'Video blur on (CSS fallback)' : 'Blur off');
+  blurAnimFrame = requestAnimationFrame(processFrame);
+
+  // ── 7. Capture canvas as stream & swap into peer connections
+  blurOutputStream = blurCanvas.captureStream(25); // 25fps
+  // Keep audio from original stream
+  const audioTracks = myStream.getAudioTracks();
+  audioTracks.forEach(t => blurOutputStream.addTrack(t));
+
+  // Swap video track in all peer connections
+  const newVideoTrack = blurOutputStream.getVideoTracks()[0];
+  Object.values(peerConns).forEach(pc => {
+    const sender = pc.getSenders().find(s => s.track?.kind === 'video');
+    if (sender) sender.replaceTrack(newVideoTrack);
+  });
+
+  // Update local preview to show blurred output
+  const myVid = document.getElementById('video-me');
+  if (myVid) myVid.srcObject = blurOutputStream;
+
+  showToast('Background blur on');
+}
+
+function stopBackgroundBlur() {
+  // Stop frame loop
+  if (blurAnimFrame) { cancelAnimationFrame(blurAnimFrame); blurAnimFrame = null; }
+
+  // Restore original video track in all peer connections
+  if (rawStream) {
+    const origVideoTrack = rawStream.getVideoTracks()[0];
+    Object.values(peerConns).forEach(pc => {
+      const sender = pc.getSenders().find(s => s.track?.kind === 'video');
+      if (sender && origVideoTrack) sender.replaceTrack(origVideoTrack);
+    });
+    // Restore local preview
+    const myVid = document.getElementById('video-me');
+    if (myVid) myVid.srcObject = rawStream;
+  }
+
+  // Cleanup
+  if (segmentation) { segmentation.close(); segmentation = null; }
+  blurCanvas = blurCtx = blurRawVideo = blurOutputStream = null;
+
+  showToast('Background blur off');
+}
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[src="${src}"]`)) { resolve(); return; }
+    const s = document.createElement('script');
+    s.src = src; s.crossOrigin = 'anonymous';
+    s.onload = resolve; s.onerror = reject;
+    document.head.appendChild(s);
+  });
 }
 
 function toggleMic() {
